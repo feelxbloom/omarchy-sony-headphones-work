@@ -40,12 +40,16 @@ the XM4:
 
 | Model | Status |
 |---|---|
-| WH-1000XM4 | Verified against real hardware |
+| WH-1000XM4 | Verified on hardware, firmware 3.0.1 — every setting below round-tripped |
 | WH-1000XM3, WH-1000XM2 | Same protocol, untested — reports welcome |
 | WF-1000XM4/XM5, WH-1000XM5/XM6, LinkBuds, CH720N | **Not supported.** These speak the v2 protocol; the plugin detects them and says so instead of sending bytes they will ignore |
 
-Features are read back from the headphones themselves, so anything a given
-model does not implement simply never appears in the panel.
+Each model honours a different subset, so the panel only draws the rows that
+model actually accepts — a control that silently does nothing is worse than one
+that is not offered. On a WH-1000XM4 that means no touch-panel switch and no
+auto-power-off timers: the headphones answer "still on" and "when taken off" to
+every such request, whatever you send them. A model this plugin does not
+recognise is offered everything.
 
 ## What you can change
 
@@ -56,8 +60,9 @@ model does not implement simply never appears in the panel.
 | Equalizer | The nine presets plus Manual; custom bands via the CLI |
 | DSEE Extreme | Upscaling of compressed audio |
 | Speak-to-Chat | On/off, sensitivity, resume timeout, voice focus |
-| Pause when taken off, touch controls, voice guidance | |
-| Automatic power off | Never, when taken off, or on a timer |
+| Pause when taken off, voice guidance | |
+| Touch controls | On models that allow it — not the WH-1000XM4 |
+| Automatic power off | Never or when taken off; timers on models that honour them |
 | Battery, firmware, codec | Read-only |
 
 ## Keyboard
@@ -102,6 +107,7 @@ bin/sony-headphones set ambient-level 12
 bin/sony-headphones set eq bass-boost
 bin/sony-headphones set eq-bands "2,0,1,0,-1,3"   # clear bass + 5 bands, -10..10
 bin/sony-headphones set dsee toggle
+bin/sony-headphones set speak-to-chat on
 bin/sony-headphones watch               # stream state changes as JSON lines
 ```
 
@@ -116,10 +122,18 @@ is answered with an acknowledgement carrying the flipped sequence number.
 the widget gets push updates when you press the button on the earcup, and short
 CLI calls apply instantly instead of paying for a fresh connection each time.
 
-BlueZ exposes no way to read a remote SDP record and `sdptool` is gone from
-bluez-utils, so the RFCOMM channel is found by trying: the init handshake tells
-a Sony control endpoint from anything else that answers, and the winning
-channel is cached under `~/.cache/omarchy-sony-headphones/`.
+The RFCOMM channel comes from the device's own SDP record, read over L2CAP by
+a small SDP client in the helper. BlueZ exposes no API for a remote service
+record and bluez-utils no longer ships `sdptool`, and guessing is not an
+option: every other channel refuses the connection, a blocking connect to a
+closed one takes seconds, and a WH-1000XM4 that has been walked channel by
+channel starts refusing the right one too. The answer is cached under
+`~/.cache/omarchy-sony-headphones/`.
+
+The headphones drop the control session on their own after a while and nothing
+announces it, so the daemon treats silence in answer to its periodic battery
+poll as a dead link, and a command that arrives on one reconnects and runs
+rather than failing in your hands.
 
 Nothing here touches the network. The only things it talks to are the
 headphones and `bluetoothctl`.
@@ -127,7 +141,7 @@ headphones and `bluetoothctl`.
 ## Development
 
 ```bash
-python3 tests/test_protocol.py     # 61 tests, no headphones required
+python3 tests/test_protocol.py     # 65 tests, no headphones required
 omarchy plugin validate .
 ```
 

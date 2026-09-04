@@ -344,11 +344,38 @@ class TestDemoDevice(unittest.TestCase):
     def test_every_toggle_flips_both_ways(self):
         for key, state_key in (("dsee", "dsee"), ("speak-to-chat", "speak_to_chat"),
                                ("pause-when-taken-off", "pause_when_taken_off"),
-                               ("touch-sensor", "touch_sensor"),
                                ("voice-notifications", "voice_notifications")):
             for value in (True, False):
                 sonyhp.apply_setting(self.link, key, "on" if value else "off")
                 self.assertIs(self.link.state[state_key], value, key)
+
+    def test_settings_the_model_ignores_are_refused(self):
+        # A WH-1000XM4 answers "still on" to every attempt at disabling its
+        # touch panel, and "when taken off" to every timer, so do not ask.
+        with self.assertRaises(ValueError):
+            sonyhp.apply_setting(self.link, "touch-sensor", "off")
+        with self.assertRaises(ValueError):
+            sonyhp.apply_setting(self.link, "auto-power-off", "3-hour")
+        sonyhp.apply_setting(self.link, "auto-power-off", "off")
+        self.assertEqual(self.link.state["auto_power_off"], "off")
+
+
+class TestFeatures(unittest.TestCase):
+    def test_known_models(self):
+        self.assertIn("speak-to-chat", sonyhp.features_for("WH-1000XM4"))
+        self.assertNotIn("touch-sensor", sonyhp.features_for("WH-1000XM4"))
+        self.assertNotIn("auto-power-off-timer", sonyhp.features_for("WH-1000XM4"))
+        self.assertIn("touch-sensor", sonyhp.features_for("WH-1000XM3"))
+        self.assertIn("auto-power-off-timer", sonyhp.features_for("WH-1000XM3"))
+        self.assertNotIn("speak-to-chat", sonyhp.features_for("WH-1000XM3"))
+        self.assertNotIn("auto-power-off", sonyhp.features_for("WH-1000XM2"))
+
+    def test_the_name_only_has_to_contain_the_model(self):
+        self.assertEqual(sonyhp.features_for("Gabriel's WH-1000XM4"), sonyhp.features_for("WH-1000XM4"))
+
+    def test_an_unknown_device_gets_everything(self):
+        self.assertEqual(set(sonyhp.features_for("WH-XB910N")), sonyhp.ALL_FEATURES)
+        self.assertEqual(set(sonyhp.features_for(None)), sonyhp.ALL_FEATURES)
 
 
 if __name__ == "__main__":

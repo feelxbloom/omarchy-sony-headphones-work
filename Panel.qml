@@ -33,6 +33,12 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool vertical: bar ? bar.vertical : false
 
+  // What this model actually honours, as reported by the helper. Rows for
+  // anything else are not drawn: a control that silently does nothing is worse
+  // than one that is not offered.
+  readonly property var features: sony.state.features || []
+  function supports(feature) { return Model.supports(features, feature) }
+
   property int cursorIndex: -1
   property bool cursorActive: false
   property real wheelAccumulator: 0
@@ -58,18 +64,20 @@ Panel {
       list.push("level")
       list.push("focus")
     }
-    list.push("eq")
-    list.push("dsee")
-    list.push("stc")
-    if (sony.state.speak_to_chat) {
-      list.push("stc-sensitivity")
-      list.push("stc-timeout")
-      list.push("stc-focus")
+    if (supports("equalizer")) list.push("eq")
+    if (supports("dsee")) list.push("dsee")
+    if (supports("speak-to-chat")) {
+      list.push("stc")
+      if (sony.state.speak_to_chat) {
+        list.push("stc-sensitivity")
+        list.push("stc-timeout")
+        list.push("stc-focus")
+      }
     }
-    list.push("pause")
-    list.push("touch")
-    list.push("voice")
-    list.push("apo")
+    if (supports("pause-when-taken-off")) list.push("pause")
+    if (supports("touch-sensor")) list.push("touch")
+    if (supports("voice-notifications")) list.push("voice")
+    if (supports("auto-power-off")) list.push("apo")
     return list
   }
 
@@ -127,7 +135,8 @@ Panel {
     } else if (key === "stc-timeout") {
       sony.choose("stc-timeout", "stc_timeout", stepOption(Model.STC_TIMEOUT, sony.state.stc_timeout, direction))
     } else if (key === "apo") {
-      sony.choose("auto-power-off", "auto_power_off", stepOption(Model.AUTO_POWER_OFF, sony.state.auto_power_off, direction))
+      sony.choose("auto-power-off", "auto_power_off",
+                  stepOption(Model.autoPowerOffOptions(root.features), sony.state.auto_power_off, direction))
     } else {
       activateRow(key)
     }
@@ -374,12 +383,15 @@ Panel {
             }
           }
 
-          PanelSeparator { visible: sony.connected; foreground: root.foreground }
+          PanelSeparator {
+            visible: sony.connected && (root.supports("equalizer") || root.supports("dsee"))
+            foreground: root.foreground
+          }
 
           // -- sound ----------------------------------------------------
 
           Column {
-            visible: sony.connected
+            visible: sony.connected && (root.supports("equalizer") || root.supports("dsee"))
             width: parent.width
             spacing: Style.space(8)
 
@@ -391,6 +403,7 @@ Panel {
 
             DropdownRow {
               rowKey: "eq"
+              visible: root.supports("equalizer")
               label: "Equalizer"
               options: Model.EQ_PRESETS
               value: String(sony.state.eq_preset || "off")
@@ -399,18 +412,22 @@ Panel {
 
             ToggleRow {
               rowKey: "dsee"
+              visible: root.supports("dsee")
               label: "DSEE Extreme"
               hint: "Upscale compressed audio"
               checked: !!sony.state.dsee
             }
           }
 
-          PanelSeparator { visible: sony.connected; foreground: root.foreground }
+          PanelSeparator {
+            visible: sony.connected && root.supports("speak-to-chat")
+            foreground: root.foreground
+          }
 
           // -- speak to chat --------------------------------------------
 
           Column {
-            visible: sony.connected
+            visible: sony.connected && root.supports("speak-to-chat")
             width: parent.width
             spacing: Style.space(8)
 
@@ -453,12 +470,17 @@ Panel {
             }
           }
 
-          PanelSeparator { visible: sony.connected; foreground: root.foreground }
+          PanelSeparator {
+            visible: sony.connected && (root.supports("pause-when-taken-off") || root.supports("touch-sensor")
+                                        || root.supports("voice-notifications") || root.supports("auto-power-off"))
+            foreground: root.foreground
+          }
 
           // -- behaviour ------------------------------------------------
 
           Column {
-            visible: sony.connected
+            visible: sony.connected && (root.supports("pause-when-taken-off") || root.supports("touch-sensor")
+                                        || root.supports("voice-notifications") || root.supports("auto-power-off"))
             width: parent.width
             spacing: Style.space(8)
 
@@ -470,26 +492,30 @@ Panel {
 
             ToggleRow {
               rowKey: "pause"
+              visible: root.supports("pause-when-taken-off")
               label: "Pause when taken off"
               checked: !!sony.state.pause_when_taken_off
             }
 
             ToggleRow {
               rowKey: "touch"
+              visible: root.supports("touch-sensor")
               label: "Touch controls"
               checked: !!sony.state.touch_sensor
             }
 
             ToggleRow {
               rowKey: "voice"
+              visible: root.supports("voice-notifications")
               label: "Voice guidance"
               checked: !!sony.state.voice_notifications
             }
 
             DropdownRow {
               rowKey: "apo"
+              visible: root.supports("auto-power-off")
               label: "Power off"
-              options: Model.AUTO_POWER_OFF
+              options: Model.autoPowerOffOptions(root.features)
               value: String(sony.state.auto_power_off || "off")
               onPicked: function(value) { sony.choose("auto-power-off", "auto_power_off", value) }
             }

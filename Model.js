@@ -54,6 +54,17 @@ var STC_TIMEOUT = [
   { value: "off", label: "Until I stop" }
 ]
 
+// The timer options exist only on models that honour them; a WH-1000XM4
+// answers "when taken off" whatever timer you ask for.
+function autoPowerOffOptions(features) {
+  if (features && features.indexOf("auto-power-off-timer") !== -1) return AUTO_POWER_OFF
+  return AUTO_POWER_OFF.slice(0, 2)
+}
+
+function supports(features, feature) {
+  return !!features && features.indexOf(feature) !== -1
+}
+
 function modeLabel(mode) {
   return MODE_LABELS[mode] || "Unknown"
 }

@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -212,6 +214,38 @@ STC_TIMEOUT_FROM_CODE = {v: k for k, v in STC_TIMEOUT.items()}
 
 AUDIO_CODECS = {0x00: "unknown", 0x01: "SBC", 0x02: "AAC", 0x10: "LDAC", 0x20: "aptX", 0x21: "aptX HD"}
 
+# What each model actually honours, verified against hardware where the status
+# says so and taken from Gadgetbridge's device coordinators otherwise. Sending a
+# command a model ignores is harmless but leaves a dead control on screen, which
+# is worse than not offering it: a WH-1000XM4 answers "still on" to every
+# attempt at disabling its touch panel, and answers "when taken off" to every
+# auto-power-off timer.
+FEATURE_SETS = {
+    "WH-1000XM4": {
+        "battery", "equalizer", "dsee", "speak-to-chat", "pause-when-taken-off",
+        "voice-notifications", "auto-power-off", "nc-optimizer",
+    },
+    "WH-1000XM3": {
+        "battery", "equalizer", "dsee", "touch-sensor", "voice-notifications",
+        "auto-power-off", "auto-power-off-timer", "nc-optimizer",
+    },
+    "WH-1000XM2": {
+        "battery", "equalizer", "dsee", "nc-optimizer",
+    },
+}
+
+# An unrecognised v1 device gets everything: better to offer a control that
+# turns out to do nothing than to hide one that would have worked.
+ALL_FEATURES = set().union(*FEATURE_SETS.values()) | {"touch-sensor", "auto-power-off-timer"}
+
+
+def features_for(name: str | None) -> list:
+    for model, features in FEATURE_SETS.items():
+        if model.lower() in str(name or "").lower():
+            return sorted(features)
+    return sorted(ALL_FEATURES)
+
+
 BATTERY_SINGLE = 0x00
 BATTERY_DUAL = 0x01
 BATTERY_CASE = 0x02
@@ -349,6 +383,7 @@ def initial_state() -> dict:
         "touch_sensor": None,
         "voice_notifications": None,
         "nc_optimizer_pressure": None,
+        "features": sorted(ALL_FEATURES),
         "error": None,
     }
 
@@ -415,7 +450,12 @@ def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
                 state["auto_power_off"] = value
         elif sub == APO_SUB_PAUSE_WHEN_TAKEN_OFF and len(payload) == 4:
             state["pause_when_taken_off"] = _bool(payload[3])
-        elif sub == APO_SUB_SPEAK_TO_CHAT and len(payload) == 4 and payload[2] == 0x01:
+        elif sub == APO_SUB_SPEAK_TO_CHAT and len(payload) == 4 and payload[2] in (0x00, 0x01):
+            # payload[2] says what this frame is about: a query answers with
+            # 0x00 and a write echoes 0x01, both carrying the on/off flag,
+            # while 0x02 reports something else entirely (a WH-1000XM4 emits
+            # `f9 05 02 00` right after being switched on) and must not be
+            # mistaken for the setting.
             state["speak_to_chat"] = _bool(payload[3])
 
     elif code in (STC_CONFIG_RET, STC_CONFIG_NOTIFY) and len(payload) == 6 and payload[1] == 0x05:
@@ -436,6 +476,128 @@ def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
 
     return state != before
 
+
+# ---------------------------------------------------------------------------
+# SDP: which RFCOMM channel is the control service on?
+# ---------------------------------------------------------------------------
+#
+# BlueZ exposes no API for a remote device's service records and bluez-utils
+# dropped sdptool, so we ask the device ourselves over L2CAP. Guessing instead
+# is not an option: RFCOMM refuses every channel but the right one, and a
+# blocking connect to a closed channel takes seconds, so walking 1..30 costs
+# minutes and hammers the headphones on the way.
+
+SDP_PSM = 1
+SDP_SERVICE_SEARCH_ATTR_REQUEST = 0x06
+SDP_SERVICE_SEARCH_ATTR_RESPONSE = 0x07
+RFCOMM_PROTOCOL_UUID = 0x0003
+SERVICE_UUID_BYTES = bytes.fromhex(SERVICE_UUID.replace("-", ""))
+
+
+def _de_sequence(body: bytes) -> bytes:
+    return bytes([(6 << 3) | 5, len(body)]) + body
+
+
+def _de_uuid128(raw: bytes) -> bytes:
+    return bytes([(3 << 3) | 4]) + raw
+
+
+def _de_uint32(value: int) -> bytes:
+    return bytes([(1 << 3) | 2]) + value.to_bytes(4, "big")
+
+
+def _parse_element(data: bytes, index: int):
+    """Decode one SDP data element. Sequences come back as lists, UUIDs as tuples."""
+    header = data[index]
+    index += 1
+    element_type, size_index = header >> 3, header & 0x07
+
+    if size_index < 5:
+        length = (1, 2, 4, 8, 16)[size_index]
+        if element_type == 0:  # nil carries no bytes at all
+            return None, index
+    elif size_index == 5:
+        length = data[index]
+        index += 1
+    elif size_index == 6:
+        length = int.from_bytes(data[index:index + 2], "big")
+        index += 2
+    else:
+        length = int.from_bytes(data[index:index + 4], "big")
+        index += 4
+
+    body = data[index:index + length]
+    end = index + length
+
+    if element_type in (6, 7):
+        items = []
+        cursor = index
+        while cursor < end:
+            value, cursor = _parse_element(data, cursor)
+            items.append(value)
+        return items, end
+    if element_type in (1, 2):
+        return int.from_bytes(body, "big"), end
+    if element_type == 3:
+        return ("uuid", int.from_bytes(body, "big")), end
+    if element_type == 5:
+        return bool(body[0]), end
+    return body, end
+
+
+def _find_rfcomm_channel(node):
+    """A protocol descriptor is [RFCOMM uuid, channel]; find the first one."""
+    if not isinstance(node, list):
+        return None
+    if (len(node) >= 2 and isinstance(node[0], tuple) and node[0][0] == "uuid"
+            and node[0][1] == RFCOMM_PROTOCOL_UUID and isinstance(node[1], int)):
+        return node[1]
+    for child in node:
+        found = _find_rfcomm_channel(child)
+        if found is not None:
+            return found
+    return None
+
+
+def sdp_channel(address: str, uuid: bytes = SERVICE_UUID_BYTES, timeout: float = 8.0) -> int | None:
+    """Ask the device which RFCOMM channel carries `uuid`, or None."""
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((address, SDP_PSM))
+        attributes = b""
+        continuation = b"\x00"
+        transaction = 1
+        while True:
+            params = (_de_sequence(_de_uuid128(uuid))
+                      + struct.pack(">H", 0xFFFF)
+                      + _de_sequence(_de_uint32(0x0000FFFF))
+                      + continuation)
+            sock.send(struct.pack(">BHH", SDP_SERVICE_SEARCH_ATTR_REQUEST, transaction, len(params)) + params)
+            response = sock.recv(2048)
+            if len(response) < 5:
+                return None
+            pdu, _, param_length = struct.unpack(">BHH", response[:5])
+            if pdu != SDP_SERVICE_SEARCH_ATTR_RESPONSE:
+                return None
+            body = response[5:5 + param_length]
+            count = int.from_bytes(body[:2], "big")
+            attributes += body[2:2 + count]
+            # A non-empty continuation state means the record did not fit; send
+            # it back verbatim to collect the rest.
+            rest = body[2 + count:]
+            if not rest or rest[0] == 0:
+                break
+            continuation = rest[:1 + rest[0]]
+            transaction += 1
+        if not attributes:
+            return None
+        tree, _ = _parse_element(attributes, 0)
+        return _find_rfcomm_channel(tree)
+    except (OSError, IndexError, struct.error):
+        return None
+    finally:
+        sock.close()
 
 # ---------------------------------------------------------------------------
 # Finding the headphones
@@ -533,6 +695,9 @@ class Link:
     """
 
     ACK_TIMEOUT = 2.0
+    # Real headphones answer a write with a notification some time later; the
+    # stand-in device answers inside write() itself.
+    answers_immediately = False
 
     def __init__(self, address: str, on_change=None):
         self.address = address
@@ -543,29 +708,40 @@ class Link:
         self.seq = 0
         self._buffer = bytearray()
         self._acked = False
+        self.last_rx = 0.0
 
     # -- connection ---------------------------------------------------------
 
     def _open(self, channel: int, timeout: float) -> socket.socket:
         sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-        sock.settimeout(timeout)
+        # BlueZ's RFCOMM refuses a non-blocking connect outright, so connect
+        # blocking (BlueZ applies its own timeout) and only then arm the read
+        # timeout the rest of the conversation runs on.
+        sock.setblocking(True)
         sock.connect((self.address, channel))
+        sock.settimeout(timeout)
         return sock
 
     def connect(self, timeout: float = 6.0) -> int:
         """Open the link and complete the init handshake. Returns the channel.
 
-        BlueZ exposes no way to read a remote SDP record, and bluez-utils no
-        longer ships sdptool, so the channel is found by trying: most channels
-        refuse the connection immediately, and the init handshake tells a real
-        Sony endpoint from any other service that happens to answer. The winner
-        is cached so this only costs anything once per device.
+        The channel comes from the device's own SDP record; the last one that
+        worked is the fallback for the rare case where SDP is briefly
+        unavailable but the channel has not moved.
         """
         candidates = []
+        discovered = sdp_channel(self.address)
+        if discovered:
+            candidates.append(discovered)
         known = cached_channel(self.address)
-        if known:
+        if known and known not in candidates:
             candidates.append(known)
-        candidates += [c for c in range(1, 31) if c != known]
+
+        if not candidates:
+            raise NotConnected(
+                f"could not find Sony's control service on {self.address}; "
+                "is this a Sony device, and is it connected?"
+            )
 
         last_error = None
         for channel in candidates:
@@ -584,13 +760,14 @@ class Link:
                     self.state["connected"] = True
                     self.state["error"] = None
                     return channel
+                last_error = "the device did not answer the init handshake"
             except OSError as exc:
                 last_error = exc
             self.close()
 
         forget_channel(self.address)
         raise NotConnected(
-            f"no Sony control channel answered on {self.address}"
+            f"could not open Sony's control channel on {self.address}"
             + (f": {last_error}" if last_error else "")
         )
 
@@ -601,26 +778,32 @@ class Link:
         speaks. Eight bytes means v2 (WF-1000XM4, XM5, LinkBuds, CH720N…) —
         a different command set entirely, so say so rather than send v1 bytes
         at a device that will ignore them.
+
+        The headphones sometimes ignore the first INIT of a session, usually
+        just after a previous one closed, so ask again rather than declaring
+        the device silent. Repeated INITs are harmless: the device answers
+        every one of them.
         """
-        self.write(MSG_COMMAND_1, bytes([INIT_REQUEST, 0x00]), wait_ack=False)
-        deadline = time.monotonic() + self.ACK_TIMEOUT
-        while time.monotonic() < deadline:
-            frame = self._read_frame(deadline - time.monotonic())
-            if frame is None:
-                continue
-            msg_type, seq, payload = frame
-            if msg_type == MSG_ACK:
-                self.seq = seq
-                continue
-            self._ack(seq)
-            if payload and payload[0] == INIT_REPLY:
-                if len(payload) == 4:
-                    return True
-                raise NotConnected(
-                    "this device speaks Sony's v2 protocol, which this plugin "
-                    "does not implement yet (v1 devices only: WH-1000XM2/XM3/XM4)"
-                )
-            self.dispatch(msg_type, payload)
+        for _ in range(3):
+            self.write(MSG_COMMAND_1, bytes([INIT_REQUEST, 0x00]), wait_ack=False)
+            deadline = time.monotonic() + self.ACK_TIMEOUT
+            while time.monotonic() < deadline:
+                frame = self._read_frame(deadline - time.monotonic())
+                if frame is None:
+                    break  # nothing more is coming in this window; ask again
+                msg_type, seq, payload = frame
+                if msg_type == MSG_ACK:
+                    self.seq = seq
+                    continue
+                self._ack(seq)
+                if payload and payload[0] == INIT_REPLY:
+                    if len(payload) == 4:
+                        return True
+                    raise NotConnected(
+                        "this device speaks Sony's v2 protocol, which this plugin "
+                        "does not implement yet (v1 devices only: WH-1000XM2/XM3/XM4)"
+                    )
+                self.dispatch(msg_type, payload)
         return False
 
     def close(self) -> None:
@@ -650,9 +833,11 @@ class Link:
                 if raw is None:
                     continue
                 try:
-                    return decode_message(raw)
+                    message = decode_message(raw)
                 except ProtocolError:
                     continue
+                self.last_rx = time.monotonic()
+                return message
 
             remaining = deadline - time.monotonic()
             if remaining <= 0 or self.sock is None:
@@ -768,8 +953,33 @@ def next_nc_mode(current: str | None) -> str:
     return order[(order.index(current) + 1) % len(order)]
 
 
+SETTING_FEATURES = {
+    "eq": "equalizer",
+    "eq-bands": "equalizer",
+    "dsee": "dsee",
+    "speak-to-chat": "speak-to-chat",
+    "stc-sensitivity": "speak-to-chat",
+    "stc-timeout": "speak-to-chat",
+    "stc-focus-on-voice": "speak-to-chat",
+    "pause-when-taken-off": "pause-when-taken-off",
+    "touch-sensor": "touch-sensor",
+    "voice-notifications": "voice-notifications",
+    "auto-power-off": "auto-power-off",
+}
+
+
 def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
     """Turn one setting change into the requests that carry it."""
+    features = state.get("features") or sorted(ALL_FEATURES)
+    needed = SETTING_FEATURES.get(key)
+    if needed and needed not in features:
+        raise ValueError(f"{state.get('name') or 'this device'} does not support {key}")
+    if key == "auto-power-off" and str(value) not in ("off", "when-taken-off") \
+            and "auto-power-off-timer" not in features:
+        raise ValueError(
+            f"{state.get('name') or 'this device'} only supports auto power off "
+            "'off' or 'when-taken-off'"
+        )
     supports_wind = state.get("supports_wind")
     supports_wind = True if supports_wind is None else supports_wind
     mode = state.get("nc_mode") or "off"
@@ -827,13 +1037,24 @@ def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
     raise ValueError(f"unknown setting {key!r}; expected one of {', '.join(SETTING_KEYS)}")
 
 
+SETTLE_TIMEOUT = 2.0
+
+
 def apply_setting(link: Link, key: str, value) -> dict:
     requests = setting_requests(link.state, key, value)
+    before = dict(link.state)
     for msg_type, payload in requests:
         link.write(msg_type, payload)
-    # The headphones echo the change back as a notification; give it a moment
-    # so the state we return is the device's, not our guess at it.
-    link.pump(0.4)
+
+    # The headphones echo every change back as a notification, so wait for the
+    # echo rather than a fixed interval: it usually lands in milliseconds, but
+    # after a burst of writes a WH-1000XM4 can take the better part of a second,
+    # and returning before it arrives reports the old value as the new one.
+    deadline = time.monotonic() + (0 if link.answers_immediately else SETTLE_TIMEOUT)
+    while time.monotonic() < deadline:
+        link.pump(0.15)
+        if link.state != before:
+            break
     return link.state
 
 
@@ -954,10 +1175,13 @@ class DemoDevice:
 class DemoLink(Link):
     """A Link whose other end is a DemoDevice instead of a radio."""
 
+    answers_immediately = True
+
     def __init__(self, on_change=None):
         super().__init__("00:00:00:00:00:00", on_change=on_change)
         self.device = DemoDevice()
         self.state["name"] = "WH-1000XM4 (demo)"
+        self.state["features"] = features_for("WH-1000XM4")
         self.state["connected"] = True
 
     def connect(self, timeout: float = 0.0) -> int:
@@ -986,9 +1210,16 @@ class DemoLink(Link):
 import select  # noqa: E402  (kept next to the daemon that needs it)
 
 
+def runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/user-{os.getuid()}"
+
+
 def socket_path() -> str:
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/user-{os.getuid()}"
-    return os.path.join(runtime, "omarchy-sony-headphones.sock")
+    return os.path.join(runtime_dir(), "omarchy-sony-headphones.sock")
+
+
+def lock_path() -> str:
+    return os.path.join(runtime_dir(), "omarchy-sony-headphones.lock")
 
 
 def emit(payload: dict) -> None:
@@ -1018,6 +1249,7 @@ class Daemon:
         self.next_attempt = 0.0
         self.next_poll = 0.0
         self.last_emitted: dict | None = None
+        self._lock = None
 
     # -- state out ----------------------------------------------------------
 
@@ -1065,6 +1297,7 @@ class Daemon:
 
         link = Link(device["address"], on_change=self.publish)
         link.state["name"] = device["name"]
+        link.state["features"] = features_for(device["name"])
         try:
             link.connect()
             link.refresh()
@@ -1095,37 +1328,48 @@ class Daemon:
 
     # -- clients ------------------------------------------------------------
 
+    def with_link(self, action):
+        """Run a device action, reconnecting once if the link has gone stale.
+
+        The headphones drop the control session on their own after a while, and
+        nothing says so until the next write, so a command that arrives on a
+        dead link should repair it rather than report failure at the user.
+        """
+        for attempt in (1, 2):
+            if self.link is None:
+                self.try_connect()
+            if self.link is None:
+                raise NotConnected("headphones not connected")
+            try:
+                return action(self.link)
+            except (NotConnected, OSError) as exc:
+                self.lose_link(str(exc))
+                if attempt == 2:
+                    raise
+
     def handle_command(self, request: dict) -> dict:
         command = str(request.get("cmd", "status"))
 
-        if command == "status":
+        if command in ("status", "ping"):
             return {"ok": True, "state": self.state()}
 
-        if command == "ping":
-            return {"ok": True, "state": self.state()}
-
-        if self.link is None:
-            return {"ok": False, "error": "headphones not connected", "state": self.state()}
+        actions = {
+            "set": lambda link: apply_setting(link, str(request.get("key", "")), request.get("value")),
+            "cycle": lambda link: apply_setting(link, "nc", "cycle"),
+            "refresh": lambda link: link.refresh(),
+            "power-off": lambda link: link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00])),
+        }
+        action = actions.get(command)
+        if action is None:
+            return {"ok": False, "error": f"unknown command {command!r}", "state": self.state()}
 
         try:
-            if command == "set":
-                state = apply_setting(self.link, str(request.get("key", "")), request.get("value"))
-                return {"ok": True, "state": state}
-            if command == "cycle":
-                state = apply_setting(self.link, "nc", "cycle")
-                return {"ok": True, "state": state}
-            if command == "refresh":
-                return {"ok": True, "state": self.link.refresh()}
-            if command == "power-off":
-                self.link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00]))
-                return {"ok": True, "state": self.state()}
+            self.with_link(action)
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "state": self.state()}
         except (NotConnected, OSError) as exc:
-            self.lose_link(str(exc))
             return {"ok": False, "error": str(exc), "state": self.state()}
-
-        return {"ok": False, "error": f"unknown command {command!r}", "state": self.state()}
+        return {"ok": True, "state": self.state()}
 
     def accept(self, listener: socket.socket) -> None:
         try:
@@ -1165,6 +1409,22 @@ class Daemon:
     # -- main loop ----------------------------------------------------------
 
     def listen(self) -> socket.socket:
+        """Claim the daemon role, or refuse to start.
+
+        Only one process may hold the Bluetooth link — a second one racing for
+        it is how the headphones end up dropping the session — so election runs
+        through an exclusive lock rather than the socket file, which two
+        processes can both decide is stale and both replace.
+        """
+        self._lock = open(lock_path(), "w")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock.close()
+            self._lock = None
+            raise SystemExit("another sony-headphones daemon is already running")
+
+        # The lock is ours, so any socket still on disk is from a dead process.
         path = socket_path()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -1172,9 +1432,6 @@ class Daemon:
         except OSError as exc:
             if exc.errno != errno.EADDRINUSE:
                 raise
-            if daemon_alive():
-                listener.close()
-                raise SystemExit("another sony-headphones daemon is already running")
             os.unlink(path)
             listener.bind(path)
         os.chmod(path, 0o600)
@@ -1212,10 +1469,17 @@ class Daemon:
 
                 if self.link is not None and not demo_mode() and time.monotonic() >= self.next_poll:
                     self.next_poll = time.monotonic() + self.POLL_INTERVAL
+                    heard = self.link.last_rx
                     try:
-                        self.link.request([req(bytes([BATTERY_GET, BATTERY_SINGLE]))], settle=0.2)
+                        self.link.request([req(bytes([BATTERY_GET, BATTERY_SINGLE]))], settle=1.0)
                     except (NotConnected, OSError) as exc:
                         self.lose_link(str(exc))
+                    else:
+                        # The socket can stay open long after the headphones
+                        # have stopped listening, so silence in answer to a
+                        # question is the only reliable sign the link is gone.
+                        if self.link is not None and self.link.last_rx == heard:
+                            self.lose_link("the headphones stopped answering")
         finally:
             if self.link is not None:
                 self.link.close()
@@ -1224,6 +1488,8 @@ class Daemon:
                 os.unlink(socket_path())
             except OSError:
                 pass
+            if self._lock is not None:
+                self._lock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1560,7 @@ def direct(request: dict, preferred: str | None) -> dict:
 
     link = Link(device["address"])
     link.state["name"] = device["name"]
+    link.state["features"] = features_for(device["name"])
     try:
         link.connect()
         link.refresh()
@@ -1446,6 +1713,8 @@ def cmd_probe(args) -> int:
 
     device = find_device(args.address) or devices[0]
     link = Link(device["address"])
+    link.state["name"] = device["name"]
+    link.state["features"] = features_for(device["name"])
     started = time.monotonic()
     try:
         channel = link.connect()

@@ -146,4 +146,12 @@ Item {
   }
 
   Component.onCompleted: if (helperPath !== "") watchProcess.running = true
+
+  // Saving a file hot-reloads the plugin, which builds a new Service; without
+  // this the old one's helper lingers, and a pile of them race to own the
+  // Bluetooth link.
+  Component.onDestruction: {
+    restartTimer.stop()
+    watchProcess.running = false
+  }
 }
