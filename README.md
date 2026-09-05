@@ -33,6 +33,22 @@ To place it somewhere specific in the bar:
 omarchy bar move gabamnml.sony-headphones --section right --index 0
 ```
 
+## Uninstall
+
+```bash
+omarchy plugin remove gabamnml.sony-headphones
+```
+
+That takes the widget off the bar and deletes the plugin directory. Two things
+live outside it and can go too, though nothing depends on them:
+
+```bash
+rm -rf ~/.cache/omarchy-sony-headphones     # the remembered RFCOMM channel
+```
+
+The helper process stops with the shell; it holds no state of its own and never
+changes a setting on the headphones unless you ask it to.
+
 ## Supported models
 
 The plugin speaks Sony's **v1** protocol, used by the over-ear 1000X line up to
