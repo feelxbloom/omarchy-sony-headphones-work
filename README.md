@@ -8,6 +8,14 @@ phone, a vendor app, or a desktop GUI.
 It talks Sony's own Bluetooth protocol directly over RFCOMM, in about seven
 hundred lines of dependency-free Python.
 
+![The panel, on a WH-1000XM4](preview.png)
+
+The widget sits in the bar with the battery reading beside it, and the icon
+follows the mode — headphones while noise cancelling, an ear in ambient sound,
+struck through when the headphones are off or away.
+
+![The widget in the bar](docs/bar.png)
+
 ```
 Left click    open the panel
 Right click   cycle noise cancelling → ambient sound → off
