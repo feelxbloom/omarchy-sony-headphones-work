@@ -152,7 +152,9 @@ record and bluez-utils no longer ships `sdptool`, and guessing is not an
 option: every other channel refuses the connection, a blocking connect to a
 closed one takes seconds, and a WH-1000XM4 that has been walked channel by
 channel starts refusing the right one too. The answer is cached under
-`~/.cache/omarchy-sony-headphones/`.
+`~/.cache/omarchy-sony-headphones/`, in a directory kept at mode 0700 and
+written without following symlinks; a cache that cannot be made private is
+declined and discovery simply runs again.
 
 The headphones drop the control session on their own after a while and nothing
 announces it, so the daemon treats silence in answer to its periodic battery
@@ -160,12 +162,24 @@ poll as a dead link, and a command that arrives on one reconnects and runs
 rather than failing in your hands.
 
 Nothing here touches the network. The only things it talks to are the
-headphones and `bluetoothctl`.
+headphones and `bluetoothctl`, which is run from its absolute path with a
+minimal environment rather than resolved through the inherited `PATH`.
+
+The daemon's control socket is worth guarding: anything that can write it can
+drive the headphones and read their state. It lives in `XDG_RUNTIME_DIR`, but
+only after that directory has been confirmed to be a real directory, owned by
+you, with mode 0700 — the variable is inherited and can point anywhere. Without
+a usable one the helper creates its own private directory under the temporary
+directory and verifies it the same way rather than trusting a predictable name
+someone else may have created first. The socket and the lock are opened
+relative to a descriptor for that directory and never through a symlink, and a
+socket left behind by a dead daemon is replaced only after it is confirmed to
+be a socket you own.
 
 ## Development
 
 ```bash
-python3 tests/test_protocol.py     # 65 tests, no headphones required
+python3 tests/test_protocol.py     # 96 tests, no headphones required
 omarchy plugin validate .
 ```
 

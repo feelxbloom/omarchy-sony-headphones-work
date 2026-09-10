@@ -10,8 +10,13 @@ Run with: python3 tests/test_protocol.py
 
 import importlib.util
 import os
+import shutil
+import socket
+import stat
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 HELPER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "sony-headphones")
 spec = importlib.util.spec_from_loader("sonyhp", importlib.machinery.SourceFileLoader("sonyhp", HELPER))
@@ -376,6 +381,254 @@ class TestFeatures(unittest.TestCase):
     def test_an_unknown_device_gets_everything(self):
         self.assertEqual(set(sonyhp.features_for("WH-XB910N")), sonyhp.ALL_FEATURES)
         self.assertEqual(set(sonyhp.features_for(None)), sonyhp.ALL_FEATURES)
+
+
+class TestRuntimeDirectory(unittest.TestCase):
+    """The socket's parent has to be a directory only we can write.
+
+    Anything that can reach the socket can drive the headphones, so these
+    check the gate rather than the protocol.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def make(self, name, mode):
+        path = os.path.join(self.tmp, name)
+        os.mkdir(path, mode)
+        os.chmod(path, mode)  # mkdir's mode is filtered through the umask
+        return path
+
+    def test_accepts_a_private_directory(self):
+        self.assertTrue(sonyhp.is_private_dir(self.make("good", 0o700)))
+
+    def test_rejects_group_or_world_access(self):
+        for mode in (0o750, 0o770, 0o755, 0o777, 0o701):
+            with self.subTest(mode=oct(mode)):
+                self.assertFalse(sonyhp.is_private_dir(self.make(f"m{mode:o}", mode)))
+
+    def test_rejects_a_symlink_even_to_a_private_directory(self):
+        target = self.make("target", 0o700)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(target, link)
+        self.assertFalse(sonyhp.is_private_dir(link))
+
+    def test_rejects_a_file_and_a_missing_path(self):
+        regular = os.path.join(self.tmp, "file")
+        open(regular, "w").close()
+        self.assertFalse(sonyhp.is_private_dir(regular))
+        self.assertFalse(sonyhp.is_private_dir(os.path.join(self.tmp, "nope")))
+
+    def test_uses_a_valid_xdg_runtime_dir(self):
+        good = self.make("xdg", 0o700)
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": good}):
+            self.assertEqual(sonyhp.runtime_dir(), good)
+
+    def temp_root(self):
+        """Point the fallback at our sandbox.
+
+        gettempdir() caches its answer on first use, so setting TMPDIR in the
+        environment would steer nothing; the lookup itself is what has to move.
+        """
+        return mock.patch.object(sonyhp.tempfile, "gettempdir", return_value=self.tmp)
+
+    def test_falls_back_when_xdg_runtime_dir_is_not_private(self):
+        loose = self.make("loose", 0o777)
+        with self.temp_root(), mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": loose}):
+            fallback = sonyhp.runtime_dir()
+        self.assertEqual(os.path.dirname(fallback), self.tmp)
+        self.assertNotEqual(fallback, loose)
+        self.assertTrue(sonyhp.is_private_dir(fallback))
+        self.assertEqual(stat.S_IMODE(os.lstat(fallback).st_mode), 0o700)
+
+    def test_the_fallback_is_private_even_under_a_loose_umask(self):
+        previous = os.umask(0o000)
+        self.addCleanup(os.umask, previous)
+        with self.temp_root(), mock.patch.dict(os.environ, {}, clear=True):
+            fallback = sonyhp.runtime_dir()
+        self.assertEqual(stat.S_IMODE(os.lstat(fallback).st_mode), 0o700)
+
+    def test_the_fallback_is_reused_once_made(self):
+        with self.temp_root(), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(sonyhp.runtime_dir(), sonyhp.runtime_dir())
+
+    def test_refuses_a_fallback_someone_else_left_loose(self):
+        # The old code would have used this directory exactly as it found it.
+        squatted = os.path.join(self.tmp, f"omarchy-sony-headphones-{os.getuid()}")
+        os.mkdir(squatted, 0o777)
+        os.chmod(squatted, 0o777)
+        with self.temp_root(), mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit):
+                sonyhp.runtime_dir()
+
+    def test_refuses_a_fallback_that_is_a_symlink(self):
+        target = self.make("target", 0o700)
+        os.symlink(target, os.path.join(self.tmp, f"omarchy-sony-headphones-{os.getuid()}"))
+        with self.temp_root(), mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit):
+                sonyhp.runtime_dir()
+
+
+class TestDaemonFiles(unittest.TestCase):
+    """The lock and the socket, opened inside a directory we trust."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.chmod(self.tmp, 0o700)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dir_fd = os.open(self.tmp, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.dir_fd)
+        self.daemon = sonyhp.Daemon()
+
+    def test_claims_and_then_refuses_a_second_claim(self):
+        lock = self.daemon.claim_lock(self.dir_fd)
+        self.addCleanup(lock.close)
+        with self.assertRaises(SystemExit):
+            sonyhp.Daemon().claim_lock(self.dir_fd)
+
+    def test_the_lock_is_not_truncated_on_open(self):
+        path = os.path.join(self.tmp, sonyhp.LOCK_NAME)
+        with open(path, "w") as handle:
+            handle.write("kept")
+        lock = self.daemon.claim_lock(self.dir_fd)
+        self.addCleanup(lock.close)
+        with open(path) as handle:
+            self.assertEqual(handle.read(), "kept")
+
+    def test_refuses_a_lock_that_is_a_symlink(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        open(elsewhere, "w").close()
+        os.symlink(elsewhere, os.path.join(self.tmp, sonyhp.LOCK_NAME))
+        with self.assertRaises(OSError):  # O_NOFOLLOW
+            self.daemon.claim_lock(self.dir_fd)
+
+    def test_removes_a_socket_we_own(self):
+        path = os.path.join(self.tmp, sonyhp.SOCKET_NAME)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(stale.close)
+        stale.bind(path)
+        self.daemon.remove_stale_socket(self.dir_fd)
+        self.assertFalse(os.path.lexists(path))
+
+    def test_a_missing_socket_is_not_an_error(self):
+        self.daemon.remove_stale_socket(self.dir_fd)
+
+    def test_refuses_to_remove_anything_that_is_not_a_socket(self):
+        path = os.path.join(self.tmp, sonyhp.SOCKET_NAME)
+        open(path, "w").close()
+        with self.assertRaises(SystemExit):
+            self.daemon.remove_stale_socket(self.dir_fd)
+        self.assertTrue(os.path.lexists(path))
+
+    def test_refuses_to_remove_a_symlink_standing_in_for_the_socket(self):
+        victim = os.path.join(self.tmp, "victim")
+        open(victim, "w").close()
+        os.symlink(victim, os.path.join(self.tmp, sonyhp.SOCKET_NAME))
+        with self.assertRaises(SystemExit):
+            self.daemon.remove_stale_socket(self.dir_fd)
+        self.assertTrue(os.path.exists(victim))
+
+
+class TestChannelCache(unittest.TestCase):
+    """The cached channel decides where the next connection is dialled."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cache = os.path.join(self.tmp, "cache")
+        self.patch = mock.patch.object(sonyhp, "CACHE_DIR", self.cache)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.address = "AA:BB:CC:DD:EE:FF"
+
+    def test_creates_the_cache_private(self):
+        self.assertEqual(sonyhp.private_cache_dir(), self.cache)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.cache).st_mode), 0o700)
+
+    def test_tightens_a_directory_left_loose(self):
+        os.mkdir(self.cache, 0o755)
+        os.chmod(self.cache, 0o755)
+        self.assertEqual(sonyhp.private_cache_dir(), self.cache)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.cache).st_mode), 0o700)
+
+    def test_declines_a_symlink(self):
+        target = os.path.join(self.tmp, "target")
+        os.mkdir(target, 0o700)
+        os.symlink(target, self.cache)
+        self.assertIsNone(sonyhp.private_cache_dir())
+
+    def test_declines_a_file(self):
+        open(self.cache, "w").close()
+        self.assertIsNone(sonyhp.private_cache_dir())
+
+    def test_round_trips_a_channel(self):
+        sonyhp.remember_channel(self.address, 9)
+        self.assertEqual(sonyhp.cached_channel(self.address), 9)
+        path = sonyhp._channel_cache_path(self.address)
+        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o600)
+
+    def test_forget_removes_it(self):
+        sonyhp.remember_channel(self.address, 9)
+        sonyhp.forget_channel(self.address)
+        self.assertIsNone(sonyhp.cached_channel(self.address))
+
+    def test_does_not_write_through_a_symlink(self):
+        os.mkdir(self.cache, 0o700)
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as handle:
+            handle.write("untouched")
+        os.symlink(victim, sonyhp._channel_cache_path(self.address))
+        sonyhp.remember_channel(self.address, 9)  # swallowed, not followed
+        with open(victim) as handle:
+            self.assertEqual(handle.read(), "untouched")
+
+    def test_does_not_read_through_a_symlink(self):
+        os.mkdir(self.cache, 0o700)
+        planted = os.path.join(self.tmp, "planted")
+        with open(planted, "w") as handle:
+            handle.write("7")
+        os.symlink(planted, sonyhp._channel_cache_path(self.address))
+        self.assertIsNone(sonyhp.cached_channel(self.address))
+
+    def test_rejects_a_channel_outside_the_valid_range(self):
+        os.mkdir(self.cache, 0o700)
+        for written in ("0", "31", "-1", "nonsense", ""):
+            with self.subTest(written=written):
+                with open(sonyhp._channel_cache_path(self.address), "w") as handle:
+                    handle.write(written)
+                self.assertIsNone(sonyhp.cached_channel(self.address))
+
+
+class TestBluetoothctlInvocation(unittest.TestCase):
+    def test_candidates_are_absolute(self):
+        for candidate in sonyhp.BLUETOOTHCTL_CANDIDATES:
+            self.assertTrue(os.path.isabs(candidate), candidate)
+
+    def test_the_environment_does_not_carry_anything_inherited(self):
+        self.assertEqual(set(sonyhp.BLUETOOTHCTL_ENV), {"PATH", "LC_ALL"})
+        self.assertEqual(sonyhp.BLUETOOTHCTL_ENV["LC_ALL"], "C")
+        for entry in sonyhp.BLUETOOTHCTL_ENV["PATH"].split(":"):
+            self.assertTrue(os.path.isabs(entry), entry)
+
+    def test_a_missing_binary_is_not_looked_up_on_path(self):
+        with mock.patch.object(sonyhp, "BLUETOOTHCTL", None):
+            with mock.patch.object(sonyhp.subprocess, "run") as run:
+                self.assertEqual(sonyhp.bluetoothctl("devices"), "")
+                run.assert_not_called()
+
+    def test_the_absolute_binary_is_what_runs(self):
+        with mock.patch.object(sonyhp, "BLUETOOTHCTL", "/usr/bin/bluetoothctl"):
+            with mock.patch.object(sonyhp.subprocess, "run") as run:
+                run.return_value = mock.Mock(stdout="")
+                sonyhp.bluetoothctl("info", "AA:BB:CC:DD:EE:FF")
+        argv, kwargs = run.call_args
+        self.assertEqual(argv[0][0], "/usr/bin/bluetoothctl")
+        self.assertEqual(kwargs["env"], sonyhp.BLUETOOTHCTL_ENV)
+
+    def test_only_names_bluetoothctl_installs_under(self):
+        for candidate in sonyhp.BLUETOOTHCTL_CANDIDATES:
+            self.assertEqual(os.path.basename(candidate), "bluetoothctl")
 
 
 if __name__ == "__main__":

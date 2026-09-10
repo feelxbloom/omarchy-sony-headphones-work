@@ -22,9 +22,11 @@ import json
 import os
 import re
 import socket
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -611,11 +613,35 @@ CACHE_DIR = os.path.join(
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", re.IGNORECASE)
 
 
+# Where BlueZ actually installs bluetoothctl. The daemon is long-lived and
+# inherits whatever environment started the bar, so resolving the name through
+# PATH would let anything earlier on that PATH answer for it; the list is
+# searched once, at import, and the absolute result is what gets executed.
+BLUETOOTHCTL_CANDIDATES = ("/usr/bin/bluetoothctl", "/bin/bluetoothctl", "/usr/local/bin/bluetoothctl")
+
+# A minimal environment for the same reason. LC_ALL pins the locale because we
+# parse the output; PATH is present only because bluetoothctl expects one.
+BLUETOOTHCTL_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+
+
+def find_bluetoothctl() -> str | None:
+    for candidate in BLUETOOTHCTL_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+BLUETOOTHCTL = find_bluetoothctl()
+
+
 def bluetoothctl(*args: str, timeout: float = 5.0) -> str:
+    if BLUETOOTHCTL is None:
+        return ""
     try:
         done = subprocess.run(
-            ["bluetoothctl", *args],
+            [BLUETOOTHCTL, *args],
             check=False, capture_output=True, text=True, timeout=timeout,
+            env=BLUETOOTHCTL_ENV,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -653,17 +679,52 @@ def _channel_cache_path(address: str) -> str:
 
 def cached_channel(address: str) -> int | None:
     try:
-        with open(_channel_cache_path(address)) as handle:
-            channel = int(handle.read().strip())
+        fd = os.open(_channel_cache_path(address), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as handle:
+            channel = int(handle.read(32).strip())
     except (OSError, ValueError):
         return None
     return channel if 1 <= channel <= 30 else None
 
 
+def private_cache_dir() -> str | None:
+    """CACHE_DIR, made private, or nothing.
+
+    The cached channel decides where the next connection is dialled, so the
+    directory holding it should be no more reachable than the runtime one.
+    ~/.cache is normally the user's own, which is why this is a smaller matter
+    than the socket — but the directory may predate this check, or have been
+    left loose by whatever created it, so it is tightened rather than assumed.
+
+    A cache is an optimisation: anything that cannot be made private is
+    declined, and channel discovery simply runs again.
+    """
+    try:
+        os.mkdir(CACHE_DIR, 0o700)
+    except FileExistsError:
+        info = os.lstat(CACHE_DIR)
+        # Ours and a real directory, but looser than it should be: fix it.
+        # A symlink, or somebody else's, is not ours to correct.
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                os.chmod(CACHE_DIR, 0o700)
+        else:
+            return None
+    except OSError:
+        return None
+    return CACHE_DIR if is_private_dir(CACHE_DIR) else None
+
+
 def remember_channel(address: str, channel: int) -> None:
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(_channel_cache_path(address), "w") as handle:
+        if private_cache_dir() is None:
+            return
+        path = _channel_cache_path(address)
+        # O_NOFOLLOW for the same reason as the lock: write the file we named,
+        # or nothing. O_TRUNC is fine here — the file is ours and its whole
+        # content is the number being replaced.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
             handle.write(str(channel))
     except OSError:
         pass
@@ -1210,16 +1271,69 @@ class DemoLink(Link):
 import select  # noqa: E402  (kept next to the daemon that needs it)
 
 
+SOCKET_NAME = "omarchy-sony-headphones.sock"
+LOCK_NAME = "omarchy-sony-headphones.lock"
+
+
+def is_private_dir(path: str, *, dir_fd: int | None = None) -> bool:
+    """True for a real directory that only this user can reach into.
+
+    lstat, not stat: a symlink pointing at a directory we do own must not pass
+    as one. Mode has to be exactly 0700 — group or other bits on the parent are
+    enough to let someone else create the socket name before we do.
+    """
+    try:
+        info = os.lstat(path) if dir_fd is None else os.lstat(path, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) == 0o700
+    )
+
+
 def runtime_dir() -> str:
-    return os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/user-{os.getuid()}"
+    """The private directory holding the socket and the lock.
+
+    Anything that can write the socket can drive the headphones and read their
+    state, so its parent must be a directory nobody else can write. A correct
+    XDG_RUNTIME_DIR already is one by definition, but the variable is inherited
+    and can point anywhere, so it is checked rather than trusted.
+
+    Without a usable one we make our own and verify it the same way. The old
+    fallback was a bare /tmp/user-<uid>, which is a name an attacker on a
+    shared machine can create first — as a symlink, or as a directory of their
+    own — and then own every file we put in it.
+    """
+    supplied = os.environ.get("XDG_RUNTIME_DIR")
+    if supplied and is_private_dir(supplied):
+        return supplied
+
+    fallback = os.path.join(tempfile.gettempdir(), f"omarchy-sony-headphones-{os.getuid()}")
+    try:
+        os.mkdir(fallback, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise SystemExit(f"cannot create a private runtime directory at {fallback}: {exc}")
+
+    # Either we just made it, or it was already there — and something we did
+    # not make is only usable if it looks exactly like something we would have.
+    if not is_private_dir(fallback):
+        raise SystemExit(
+            f"{fallback} is not a private directory owned by this user; "
+            "set XDG_RUNTIME_DIR to a directory you own with mode 0700"
+        )
+    return fallback
 
 
 def socket_path() -> str:
-    return os.path.join(runtime_dir(), "omarchy-sony-headphones.sock")
+    return os.path.join(runtime_dir(), SOCKET_NAME)
 
 
 def lock_path() -> str:
-    return os.path.join(runtime_dir(), "omarchy-sony-headphones.lock")
+    return os.path.join(runtime_dir(), LOCK_NAME)
 
 
 def emit(payload: dict) -> None:
@@ -1250,6 +1364,7 @@ class Daemon:
         self.next_poll = 0.0
         self.last_emitted: dict | None = None
         self._lock = None
+        self._socket_path = None
 
     # -- state out ----------------------------------------------------------
 
@@ -1416,27 +1531,78 @@ class Daemon:
         through an exclusive lock rather than the socket file, which two
         processes can both decide is stale and both replace.
         """
-        self._lock = open(lock_path(), "w")
+        directory = runtime_dir()
+        self._socket_path = os.path.join(directory, SOCKET_NAME)
+        # Both files are opened relative to a descriptor for the directory that
+        # was just verified private, so that is the directory they land in
+        # whatever the path resolves to by the time we get there.
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self._lock.close()
-            self._lock = None
-            raise SystemExit("another sony-headphones daemon is already running")
-
-        # The lock is ours, so any socket still on disk is from a dead process.
-        path = socket_path()
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            listener.bind(path)
-        except OSError as exc:
-            if exc.errno != errno.EADDRINUSE:
-                raise
-            os.unlink(path)
-            listener.bind(path)
-        os.chmod(path, 0o600)
+            self._lock = self.claim_lock(dir_fd)
+            listener = self.bind_socket(dir_fd)
+        finally:
+            os.close(dir_fd)
         listener.listen(8)
         return listener
+
+    def claim_lock(self, dir_fd: int):
+        """Open the lock file and take it, or refuse to start."""
+        # O_NOFOLLOW: a symlink parked under the name is an error, not a write
+        # somewhere else. And no truncation — the lock holds nothing worth
+        # clearing, and truncating on open is how a file that turns out to
+        # belong to someone else gets damaged before we ever look at it.
+        fd = os.open(
+            LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        lock = os.fdopen(fd, "r+")
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            lock.close()
+            raise SystemExit(f"{LOCK_NAME} is not a regular file owned by this user")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            raise SystemExit("another sony-headphones daemon is already running")
+        return lock
+
+    def bind_socket(self, dir_fd: int) -> socket.socket:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # umask rather than a chmod afterwards: bind then creates the socket
+        # already unreachable to anyone else, with no window in between.
+        previous = os.umask(0o177)
+        try:
+            try:
+                listener.bind(self._socket_path)
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+                self.remove_stale_socket(dir_fd)
+                listener.bind(self._socket_path)
+        finally:
+            os.umask(previous)
+        return listener
+
+    def remove_stale_socket(self, dir_fd: int) -> None:
+        """Clear a socket left behind by a dead daemon — and nothing else.
+
+        We hold the lock, so anything still on disk under our name is from a
+        process that is gone. That reasoning only holds for a socket we own,
+        though: unlinking whatever happens to be sitting there is how someone
+        else's file, or a symlink to one, becomes ours to delete.
+        """
+        try:
+            info = os.lstat(SOCKET_NAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise SystemExit(
+                f"refusing to replace {SOCKET_NAME}: it is not a socket owned by this user"
+            )
+        os.unlink(SOCKET_NAME, dir_fd=dir_fd)
 
     def run(self) -> None:
         listener = self.listen()
@@ -1485,7 +1651,7 @@ class Daemon:
                 self.link.close()
             listener.close()
             try:
-                os.unlink(socket_path())
+                os.unlink(self._socket_path)
             except OSError:
                 pass
             if self._lock is not None:
