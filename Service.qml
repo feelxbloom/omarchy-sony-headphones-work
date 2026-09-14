@@ -26,8 +26,24 @@ Item {
 
   signal changed()
 
+  // The shell is long-lived and inherits whatever environment started it, so
+  // neither the interpreter nor its environment is taken from there: python3 is
+  // bound by absolute path, run isolated (-I: no PYTHON* variables, no user
+  // site-packages, no script directory on sys.path), and handed only the
+  // variables the helper reads.
+  readonly property string interpreter: "/usr/bin/python3"
+  readonly property var helperEnvironment: {
+    var env = { PATH: "/usr/bin:/bin" }
+    var passed = ["HOME", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "SONY_HEADPHONES_DEMO"]
+    for (var i = 0; i < passed.length; i++) {
+      var value = Quickshell.env(passed[i])
+      if (value !== undefined && value !== null && String(value) !== "") env[passed[i]] = String(value)
+    }
+    return env
+  }
+
   function argv(args) {
-    var command = ["python3", helperPath]
+    var command = [interpreter, "-I", helperPath]
     if (address !== "") command = command.concat(["--address", address])
     return command.concat(args)
   }
@@ -103,6 +119,8 @@ Item {
   Process {
     id: watchProcess
     running: false
+    clearEnvironment: true
+    environment: root.helperEnvironment
     command: root.argv(["watch"])
     stdout: SplitParser { onRead: function(line) { root.applyLine(line) } }
     stderr: SplitParser { onRead: function(line) {
@@ -120,6 +138,8 @@ Item {
   Process {
     id: setProcess
     running: false
+    clearEnvironment: true
+    environment: root.helperEnvironment
     command: []
     stderr: SplitParser { onRead: function(line) {
       var text = String(line || "").trim()
@@ -134,6 +154,8 @@ Item {
   Process {
     id: refreshProcess
     running: false
+    clearEnvironment: true
+    environment: root.helperEnvironment
     command: []
     stdout: SplitParser { onRead: function(line) { root.applyLine(line) } }
   }

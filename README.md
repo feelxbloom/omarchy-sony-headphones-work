@@ -163,7 +163,11 @@ rather than failing in your hands.
 
 Nothing here touches the network. The only things it talks to are the
 headphones and `bluetoothctl`, which is run from its absolute path with a
-minimal environment rather than resolved through the inherited `PATH`.
+minimal environment rather than resolved through the inherited `PATH`. The
+helper is launched the same way: the shell runs it with `/usr/bin/python3 -I`
+— never a `python3` looked up on `PATH`, and isolated from `PYTHON*` variables
+and user site-packages — and hands it only `HOME`, `XDG_RUNTIME_DIR`,
+`XDG_CACHE_HOME` and a fixed `PATH`.
 
 The daemon's control socket is worth guarding: anything that can write it can
 drive the headphones and read their state. It lives in `XDG_RUNTIME_DIR`, but
@@ -179,7 +183,7 @@ be a socket you own.
 ## Development
 
 ```bash
-python3 tests/test_protocol.py     # 96 tests, no headphones required
+python3 tests/test_protocol.py     # 100 tests, no headphones required
 omarchy plugin validate .
 ```
 

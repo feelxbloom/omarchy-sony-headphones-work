@@ -631,5 +631,39 @@ class TestBluetoothctlInvocation(unittest.TestCase):
             self.assertEqual(os.path.basename(candidate), "bluetoothctl")
 
 
+class TestShellLaunch(unittest.TestCase):
+    """The QML side is what starts the helper, so it has to hold the same line.
+
+    There is no QML engine here, so these read Service.qml as text: enough to
+    catch the interpreter going back to a bare name or a Process losing its
+    minimal environment.
+    """
+
+    SERVICE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Service.qml")
+
+    def setUp(self):
+        with open(self.SERVICE, encoding="utf-8") as handle:
+            self.source = handle.read()
+
+    def test_the_interpreter_is_bound_by_absolute_path(self):
+        self.assertIn('readonly property string interpreter: "/usr/bin/python3"', self.source)
+        self.assertIn('[interpreter, "-I", helperPath]', self.source)
+        self.assertNotIn('"python3"', self.source)
+
+    def test_every_process_runs_with_the_minimal_environment(self):
+        processes = self.source.count("Process {")
+        self.assertEqual(processes, 3)
+        self.assertEqual(self.source.count("clearEnvironment: true"), processes)
+        self.assertEqual(self.source.count("environment: root.helperEnvironment"), processes)
+
+    def test_the_environment_carries_only_what_the_helper_reads(self):
+        self.assertIn('var env = { PATH: "/usr/bin:/bin" }', self.source)
+        self.assertIn('["HOME", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "SONY_HEADPHONES_DEMO"]', self.source)
+
+    def test_the_helper_itself_names_the_system_interpreter(self):
+        with open(HELPER, encoding="utf-8") as handle:
+            self.assertEqual(handle.readline().strip(), "#!/usr/bin/python3")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
