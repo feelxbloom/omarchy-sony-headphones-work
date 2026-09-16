@@ -495,6 +495,20 @@ SDP_SERVICE_SEARCH_ATTR_RESPONSE = 0x07
 RFCOMM_PROTOCOL_UUID = 0x0003
 SERVICE_UUID_BYTES = bytes.fromhex(SERVICE_UUID.replace("-", ""))
 
+# The device decides how long this exchange runs and how much it sends, so both
+# are capped here rather than left to it. A real answer is a few hundred bytes
+# in one or two rounds; a peer that keeps handing back continuations — out of
+# malice or a fault — is cut off instead of held in memory and waited on.
+SDP_RECV_SIZE = 2048
+SDP_MAX_RECORD_BYTES = 8192   # aggregate attribute bytes across every round
+SDP_MAX_ROUNDS = 8            # request/response pairs, continuations included
+SDP_MAX_CONTINUATION = 16     # the spec caps continuation information at 16 bytes
+SDP_MAX_DEPTH = 16            # element nesting; a real record is three or four deep
+
+
+class SdpError(ValueError):
+    """The device's answer was malformed, oversized, or never finished."""
+
 
 def _de_sequence(body: bytes) -> bytes:
     return bytes([(6 << 3) | 5, len(body)]) + body
@@ -508,8 +522,14 @@ def _de_uint32(value: int) -> bytes:
     return bytes([(1 << 3) | 2]) + value.to_bytes(4, "big")
 
 
-def _parse_element(data: bytes, index: int):
-    """Decode one SDP data element. Sequences come back as lists, UUIDs as tuples."""
+def _parse_element(data: bytes, index: int, depth: int = 0):
+    """Decode one SDP data element. Sequences come back as lists, UUIDs as tuples.
+
+    Recursive, so nesting is capped: without that a record of a few thousand
+    bytes can be nothing but sequence headers and exhaust the stack.
+    """
+    if depth > SDP_MAX_DEPTH:
+        raise SdpError("the service record is nested too deeply")
     header = data[index]
     index += 1
     element_type, size_index = header >> 3, header & 0x07
@@ -528,15 +548,19 @@ def _parse_element(data: bytes, index: int):
         length = int.from_bytes(data[index:index + 4], "big")
         index += 4
 
-    body = data[index:index + length]
     end = index + length
+    if end > len(data):
+        raise SdpError("an element runs past the end of the service record")
+    body = data[index:end]
 
     if element_type in (6, 7):
         items = []
         cursor = index
         while cursor < end:
-            value, cursor = _parse_element(data, cursor)
+            value, cursor = _parse_element(data, cursor, depth + 1)
             items.append(value)
+        if cursor != end:
+            raise SdpError("an element runs past the end of its sequence")
         return items, end
     if element_type in (1, 2):
         return int.from_bytes(body, "big"), end
@@ -561,42 +585,97 @@ def _find_rfcomm_channel(node):
     return None
 
 
+def sdp_query(sock, uuid: bytes, timeout: float, clock=time.monotonic) -> bytes:
+    """Run a service search on a connected SDP socket; return the record bytes.
+
+    The answer may arrive in pieces, each ending in a continuation state that
+    has to be sent back to get the next one. Everything about that loop is
+    the device's to decide, so all of it is bounded: the total record size,
+    the number of rounds, and the wall-clock time for the whole exchange —
+    not just each read, which a peer can satisfy forever by answering just in
+    time. A continuation must also make progress and never repeat; a peer
+    replaying one is going in circles, whatever the round count says.
+    """
+    deadline = clock() + timeout
+    record = bytearray()
+    continuation = b"\x00"
+    seen: set[bytes] = set()
+
+    def remaining() -> float:
+        left = deadline - clock()
+        if left <= 0:
+            raise SdpError("the device did not finish answering in time")
+        return left
+
+    for transaction in range(1, SDP_MAX_ROUNDS + 1):
+        params = (_de_sequence(_de_uuid128(uuid))
+                  + struct.pack(">H", 0xFFFF)
+                  + _de_sequence(_de_uint32(0x0000FFFF))
+                  + continuation)
+        sock.settimeout(remaining())
+        sock.send(struct.pack(">BHH", SDP_SERVICE_SEARCH_ATTR_REQUEST, transaction, len(params)) + params)
+        sock.settimeout(remaining())
+        response = sock.recv(SDP_RECV_SIZE)
+
+        if len(response) < 5:
+            raise SdpError("the response is shorter than its header")
+        pdu, answered, param_length = struct.unpack(">BHH", response[:5])
+        if pdu != SDP_SERVICE_SEARCH_ATTR_RESPONSE:
+            raise SdpError(f"unexpected SDP response 0x{pdu:02x}")
+        if answered != transaction:
+            raise SdpError("the response answers a different request")
+        body = response[5:5 + param_length]
+        if len(body) != param_length or len(body) < 2:
+            raise SdpError("the response is shorter than it declares")
+
+        count = int.from_bytes(body[:2], "big")
+        chunk = body[2:2 + count]
+        if len(chunk) != count:
+            raise SdpError("the attribute bytes run past the response")
+        if len(record) + count > SDP_MAX_RECORD_BYTES:
+            raise SdpError("the service record is larger than any real one")
+        record += chunk
+
+        # A missing continuation byte is off-spec but unambiguous: nothing
+        # follows. It was accepted before and costs nothing to keep accepting.
+        rest = body[2 + count:]
+        if not rest or rest[0] == 0:
+            return bytes(record)
+
+        if rest[0] > SDP_MAX_CONTINUATION or len(rest) != 1 + rest[0]:
+            raise SdpError("the continuation state is malformed")
+        if count == 0:
+            raise SdpError("a continuation arrived without any data")
+        if rest in seen:
+            raise SdpError("the device repeated a continuation state")
+        seen.add(rest)
+        continuation = rest
+
+    raise SdpError("the device kept asking for more rounds than any real record needs")
+
+
+def parse_sdp_record(record: bytes):
+    # Anything after the first element is ignored, as it always was: it costs
+    # nothing, and rejecting it would only risk a device that works today.
+    tree, _ = _parse_element(record, 0)
+    return tree
+
+
 def sdp_channel(address: str, uuid: bytes = SERVICE_UUID_BYTES, timeout: float = 8.0) -> int | None:
-    """Ask the device which RFCOMM channel carries `uuid`, or None."""
+    """Ask the device which RFCOMM channel carries `uuid`, or None.
+
+    `timeout` covers the whole lookup, connecting included.
+    """
+    deadline = time.monotonic() + timeout
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
     sock.settimeout(timeout)
     try:
         sock.connect((address, SDP_PSM))
-        attributes = b""
-        continuation = b"\x00"
-        transaction = 1
-        while True:
-            params = (_de_sequence(_de_uuid128(uuid))
-                      + struct.pack(">H", 0xFFFF)
-                      + _de_sequence(_de_uint32(0x0000FFFF))
-                      + continuation)
-            sock.send(struct.pack(">BHH", SDP_SERVICE_SEARCH_ATTR_REQUEST, transaction, len(params)) + params)
-            response = sock.recv(2048)
-            if len(response) < 5:
-                return None
-            pdu, _, param_length = struct.unpack(">BHH", response[:5])
-            if pdu != SDP_SERVICE_SEARCH_ATTR_RESPONSE:
-                return None
-            body = response[5:5 + param_length]
-            count = int.from_bytes(body[:2], "big")
-            attributes += body[2:2 + count]
-            # A non-empty continuation state means the record did not fit; send
-            # it back verbatim to collect the rest.
-            rest = body[2 + count:]
-            if not rest or rest[0] == 0:
-                break
-            continuation = rest[:1 + rest[0]]
-            transaction += 1
-        if not attributes:
+        record = sdp_query(sock, uuid, deadline - time.monotonic())
+        if not record:
             return None
-        tree, _ = _parse_element(attributes, 0)
-        return _find_rfcomm_channel(tree)
-    except (OSError, IndexError, struct.error):
+        return _find_rfcomm_channel(parse_sdp_record(record))
+    except (OSError, SdpError, IndexError, struct.error):
         return None
     finally:
         sock.close()
@@ -891,7 +970,7 @@ class Link:
                 start = self._buffer.rfind(HEADER, 0, end)
                 raw = bytes(self._buffer[start:end + 1]) if start != -1 else None
                 del self._buffer[:end + 1]
-                if raw is None:
+                if raw is None or len(raw) > MAX_MESSAGE_SIZE:
                     continue
                 try:
                     message = decode_message(raw)
@@ -915,6 +994,23 @@ class Link:
             if not chunk:
                 raise NotConnected("the headphones closed the connection")
             self._buffer.extend(chunk)
+            self._trim_buffer()
+
+    def _trim_buffer(self) -> None:
+        """Keep at most one frame's worth of bytes that have no trailer yet.
+
+        The buffer outlives each read, so a device that never sends a trailer
+        would otherwise grow it for as long as the link stays up. No real frame
+        is longer than MAX_MESSAGE_SIZE: past that, only a header close enough
+        to the end to still start a valid frame is worth keeping.
+        """
+        if len(self._buffer) <= MAX_MESSAGE_SIZE or TRAILER in self._buffer:
+            return
+        start = self._buffer.rfind(HEADER)
+        if start == -1 or len(self._buffer) - start > MAX_MESSAGE_SIZE:
+            self._buffer.clear()
+        else:
+            del self._buffer[:start]
 
     def _ack(self, their_seq: int) -> None:
         if self.sock is None:
@@ -1336,6 +1432,11 @@ def lock_path() -> str:
     return os.path.join(runtime_dir(), LOCK_NAME)
 
 
+# One JSON line on the control socket. State and requests are a few hundred
+# bytes; this is far above that and still small enough to hold without care.
+MAX_LINE_BYTES = 65536
+
+
 def emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
@@ -1352,6 +1453,7 @@ class Daemon:
     """
 
     POLL_INTERVAL = 60.0
+    REQUEST_TIMEOUT = 2.0
     RETRY_MIN = 2.0
     RETRY_MAX = 30.0
 
@@ -1491,10 +1593,17 @@ class Daemon:
             client, _ = listener.accept()
         except OSError:
             return
-        client.settimeout(2.0)
+        # The daemon serves one client at a time, so the deadline covers the
+        # whole request: a per-read timeout alone lets a client trickle a byte
+        # at a time and hold everything else up for as long as it likes.
+        deadline = time.monotonic() + self.REQUEST_TIMEOUT
         try:
             data = b""
-            while b"\n" not in data and len(data) < 65536:
+            while b"\n" not in data and len(data) < MAX_LINE_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("the request took too long to arrive")
+                client.settimeout(remaining)
                 chunk = client.recv(4096)
                 if not chunk:
                     break
@@ -1686,10 +1795,17 @@ def ask_daemon(request: dict, timeout: float = 10.0) -> dict | None:
     sock = daemon_socket(timeout)
     if sock is None:
         return None
+    deadline = time.monotonic() + timeout
     try:
         sock.sendall((json.dumps(request) + "\n").encode())
         data = b""
         while b"\n" not in data:
+            if len(data) > MAX_LINE_BYTES:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(remaining)
             chunk = sock.recv(4096)
             if not chunk:
                 break
@@ -1818,6 +1934,10 @@ def cmd_watch(args) -> int:
                     if line.strip():
                         sys.stdout.write(line.decode() + "\n")
                         sys.stdout.flush()
+                # The widget restarts a watcher that exits, so giving up on a
+                # line that never ends is safe and better than holding it.
+                if len(buffered) > MAX_LINE_BYTES:
+                    return 1
         except (OSError, KeyboardInterrupt):
             return 0
         finally:

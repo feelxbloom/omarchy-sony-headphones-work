@@ -13,8 +13,10 @@ import os
 import shutil
 import socket
 import stat
+import struct
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -598,6 +600,318 @@ class TestChannelCache(unittest.TestCase):
                 with open(sonyhp._channel_cache_path(self.address), "w") as handle:
                     handle.write(written)
                 self.assertIsNone(sonyhp.cached_channel(self.address))
+
+
+# -- SDP ---------------------------------------------------------------------
+
+def de_seq(*items):
+    body = b"".join(items)
+    return bytes([0x35, len(body)]) + body
+
+
+def de_uuid16(value):
+    return bytes([0x19]) + value.to_bytes(2, "big")
+
+
+def de_uint8(value):
+    return bytes([0x08, value])
+
+
+def de_uint16(value):
+    return bytes([0x09]) + value.to_bytes(2, "big")
+
+
+# The shape a real device returns: one record whose protocol descriptor list
+# (attribute 0x0004) is [[L2CAP], [RFCOMM, channel]].
+RECORD = de_seq(de_seq(
+    de_uint16(0x0004),
+    de_seq(de_seq(de_uuid16(0x0100)), de_seq(de_uuid16(0x0003), de_uint8(9))),
+))
+
+
+def sdp_response(transaction, attributes, continuation=b"\x00", pdu=0x07, declared=None):
+    body = len(attributes).to_bytes(2, "big") + attributes + continuation
+    length = len(body) if declared is None else declared
+    return struct.pack(">BHH", pdu, transaction, length) + body
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class FakeSdpSocket:
+    """Plays back scripted responses; each may be a callable of the request."""
+
+    def __init__(self, responses, clock=None, recv_cost=0.0):
+        self.responses = list(responses)
+        self.sent = []
+        self.timeouts = []
+        self.clock = clock
+        self.recv_cost = recv_cost
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def send(self, data):
+        self.sent.append(data)
+        return len(data)
+
+    def recv(self, size):
+        if self.clock is not None:
+            self.clock.now += self.recv_cost
+        if not self.responses:
+            raise AssertionError("asked for more responses than were scripted")
+        response = self.responses.pop(0)
+        return response(self.sent[-1]) if callable(response) else response
+
+
+def endless_continuations(request):
+    # Always a fresh state and a byte of data: never repeats, never finishes.
+    transaction = struct.unpack(">H", request[1:3])[0]
+    return sdp_response(transaction, b"\x00", bytes([2]) + transaction.to_bytes(2, "big"))
+
+
+class TestSdpExchange(unittest.TestCase):
+    def query(self, responses, **kwargs):
+        clock = kwargs.pop("clock", FakeClock())
+        sock = FakeSdpSocket(responses, clock=clock, recv_cost=kwargs.pop("recv_cost", 0.0))
+        return sonyhp.sdp_query(sock, sonyhp.SERVICE_UUID_BYTES, kwargs.pop("timeout", 8.0), clock=clock), sock
+
+    def test_a_single_round_record(self):
+        record, sock = self.query([sdp_response(1, RECORD)])
+        self.assertEqual(record, RECORD)
+        self.assertEqual(sonyhp._find_rfcomm_channel(sonyhp.parse_sdp_record(record)), 9)
+        self.assertEqual(len(sock.sent), 1)
+
+    def test_a_record_split_across_a_continuation(self):
+        state = bytes([2, 0xAB, 0xCD])
+        record, sock = self.query([
+            sdp_response(1, RECORD[:10], state),
+            sdp_response(2, RECORD[10:]),
+        ])
+        self.assertEqual(record, RECORD)
+        self.assertTrue(sock.sent[1].endswith(state), "the continuation is sent back verbatim")
+        self.assertEqual(struct.unpack(">H", sock.sent[1][1:3])[0], 2)
+
+    def test_a_missing_continuation_byte_still_ends_the_exchange(self):
+        packet = sdp_response(1, RECORD, continuation=b"")
+        record, _ = self.query([packet])
+        self.assertEqual(record, RECORD)
+
+    def test_endless_continuations_stop_at_the_round_limit(self):
+        responses = [endless_continuations] * (sonyhp.SDP_MAX_ROUNDS + 5)
+        sock = FakeSdpSocket(responses)
+        with self.assertRaises(sonyhp.SdpError):
+            sonyhp.sdp_query(sock, sonyhp.SERVICE_UUID_BYTES, 8.0, clock=FakeClock())
+        self.assertEqual(len(sock.sent), sonyhp.SDP_MAX_ROUNDS)
+
+    def test_a_repeated_continuation_state_is_rejected(self):
+        state = bytes([1, 0x42])
+        with self.assertRaisesRegex(sonyhp.SdpError, "repeated"):
+            self.query([sdp_response(1, b"\x00", state), sdp_response(2, b"\x00", state)])
+
+    def test_a_continuation_without_data_is_rejected(self):
+        with self.assertRaisesRegex(sonyhp.SdpError, "without any data"):
+            self.query([sdp_response(1, b"", bytes([1, 0x42]))])
+
+    def test_the_aggregate_record_size_is_capped(self):
+        # 1500 per round crosses the aggregate cap on round six, before the
+        # round limit would; each packet still fits one read.
+        piece = b"\x00" * 1500
+        responses = [
+            (lambda n: sdp_response(n, piece, bytes([1, n])))(n)
+            for n in range(1, sonyhp.SDP_MAX_ROUNDS + 1)
+        ]
+        with self.assertRaisesRegex(sonyhp.SdpError, "larger"):
+            _, sock = self.query(responses)
+        self.assertLess(sonyhp.SDP_MAX_RECORD_BYTES // 1500 + 1, sonyhp.SDP_MAX_ROUNDS)
+
+    def test_a_malformed_continuation_state_is_rejected(self):
+        cases = {
+            "too long": bytes([17]) + bytes(17),
+            "truncated": bytes([4, 0x01, 0x02]),
+            "trailing": bytes([1, 0x01, 0x02]),
+        }
+        for name, state in cases.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(sonyhp.SdpError, "continuation state is malformed"):
+                    self.query([sdp_response(1, b"\x00", state)])
+
+    def test_the_whole_exchange_has_a_deadline(self):
+        # Each answer arrives just inside any per-read timeout; the total does not.
+        clock = FakeClock()
+        sock = FakeSdpSocket([endless_continuations] * sonyhp.SDP_MAX_ROUNDS, clock=clock, recv_cost=3.0)
+        with self.assertRaisesRegex(sonyhp.SdpError, "in time"):
+            sonyhp.sdp_query(sock, sonyhp.SERVICE_UUID_BYTES, 8.0, clock=clock)
+        self.assertLess(len(sock.sent), sonyhp.SDP_MAX_ROUNDS)
+        self.assertTrue(all(0 < t <= 8.0 for t in sock.timeouts))
+        self.assertLessEqual(sock.timeouts[-1], 2.0, "later reads get only what is left")
+
+    def test_an_already_spent_budget_sends_nothing(self):
+        sock = FakeSdpSocket([])
+        with self.assertRaises(sonyhp.SdpError):
+            sonyhp.sdp_query(sock, sonyhp.SERVICE_UUID_BYTES, 0.0, clock=FakeClock())
+        self.assertEqual(sock.sent, [])
+
+    def test_malformed_responses_are_rejected(self):
+        cases = {
+            "short header": b"\x07\x00",
+            "wrong pdu": sdp_response(1, RECORD, pdu=0x01),
+            "wrong transaction": sdp_response(7, RECORD),
+            "declared longer than sent": sdp_response(1, RECORD, declared=500),
+            "count past the end": struct.pack(">BHH", 0x07, 1, 3) + b"\x00\x40\x00",
+        }
+        for name, packet in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(sonyhp.SdpError):
+                    self.query([packet])
+
+
+class TestSdpRecordParsing(unittest.TestCase):
+    def test_deep_nesting_is_an_sdp_error_not_a_crash(self):
+        record = b""
+        for _ in range(sonyhp.SDP_MAX_DEPTH + 2):
+            record = bytes([0x36]) + len(record).to_bytes(2, "big") + record
+        with self.assertRaisesRegex(sonyhp.SdpError, "nested"):
+            sonyhp.parse_sdp_record(record)
+
+    def test_depth_that_stack_would_not_survive(self):
+        record = b""
+        for _ in range(3000):
+            record = bytes([0x37]) + len(record).to_bytes(4, "big") + record
+        with self.assertRaises(sonyhp.SdpError):
+            sonyhp.parse_sdp_record(record)
+
+    def test_an_element_longer_than_the_record(self):
+        with self.assertRaisesRegex(sonyhp.SdpError, "past the end"):
+            sonyhp.parse_sdp_record(bytes([0x35, 0x40, 0x08, 0x01]))
+
+    def test_a_child_that_overruns_its_sequence(self):
+        # The outer sequence claims 2 bytes; its child needs 3.
+        record = bytes([0x35, 0x02]) + de_uint16(0x0004) + b"\x00"
+        with self.assertRaisesRegex(sonyhp.SdpError, "sequence"):
+            sonyhp.parse_sdp_record(record)
+
+    def test_trailing_bytes_are_ignored_as_before(self):
+        tree = sonyhp.parse_sdp_record(RECORD + b"\x00\x00")
+        self.assertEqual(sonyhp._find_rfcomm_channel(tree), 9)
+
+
+class TestSdpChannel(unittest.TestCase):
+    """sdp_channel turns every refusal into None, never an exception."""
+
+    def run_channel(self, responses):
+        sock = FakeSdpSocket(responses)
+        sock.connect = lambda address: None
+        sock.close = lambda: None
+        with mock.patch.object(sonyhp.socket, "AF_BLUETOOTH", 31, create=True), \
+                mock.patch.object(sonyhp.socket, "BTPROTO_L2CAP", 0, create=True), \
+                mock.patch.object(sonyhp.socket, "socket", return_value=sock):
+            return sonyhp.sdp_channel("AA:BB:CC:DD:EE:FF")
+
+    def test_finds_the_channel(self):
+        self.assertEqual(self.run_channel([sdp_response(1, RECORD)]), 9)
+
+    def test_a_misbehaving_device_yields_none(self):
+        self.assertIsNone(self.run_channel([endless_continuations] * sonyhp.SDP_MAX_ROUNDS))
+
+    def test_a_hostile_record_yields_none(self):
+        record = b""
+        for _ in range(3000):
+            record = bytes([0x37]) + len(record).to_bytes(4, "big") + record
+        record = record[:sonyhp.SDP_MAX_RECORD_BYTES]
+        self.assertIsNone(self.run_channel([sdp_response(1, record)]))
+
+
+# -- RFCOMM and the local socket -----------------------------------------------
+
+class FakeStream:
+    def __init__(self, chunks, delay=0.0):
+        self.chunks = chunks
+        self.delay = delay
+        self.calls = 0
+        self.closed = False
+
+    def settimeout(self, value):
+        pass
+
+    def sendall(self, data):
+        pass
+
+    def recv(self, size):
+        self.calls += 1
+        if self.delay:
+            time.sleep(self.delay)
+        chunk = self.chunks(self.calls) if callable(self.chunks) else self.chunks
+        return chunk[:size]
+
+    def close(self):
+        self.closed = True
+
+
+class TestRfcommBuffer(unittest.TestCase):
+    def link(self, chunks):
+        link = sonyhp.Link("AA:BB:CC:DD:EE:FF")
+        link.sock = FakeStream(chunks)
+        return link
+
+    def test_bytes_without_a_trailer_do_not_accumulate(self):
+        link = self.link(b"\x00" * 1024)
+        for _ in range(5):
+            self.assertIsNone(link._read_frame(0.02))
+            self.assertLessEqual(len(link._buffer), sonyhp.MAX_MESSAGE_SIZE)
+        self.assertGreater(link.sock.calls, 20, "the device really did keep sending")
+
+    def test_a_frame_after_junk_still_arrives(self):
+        frame = sonyhp.encode_message(sonyhp.MSG_COMMAND_1, 1, bytes([0x01, 0x02]))
+        link = self.link(lambda n: b"\x00" * 1024 if n <= 10 else frame)
+        self.assertEqual(link._read_frame(1.0), (sonyhp.MSG_COMMAND_1, 1, bytes([0x01, 0x02])))
+
+    def test_a_frame_split_across_the_trim_point_survives(self):
+        frame = sonyhp.encode_message(sonyhp.MSG_COMMAND_1, 0, bytes(range(40)))
+        head, tail = frame[:20], frame[20:]
+        # Junk that pushes past the limit, then the start of a frame, then the rest.
+        script = [b"\x00" * 1024, b"\x00" * 1024, b"\x00" * 1000 + head, tail]
+        link = self.link(lambda n: script[min(n, len(script)) - 1])
+        self.assertEqual(link._read_frame(1.0)[2], bytes(range(40)))
+
+    def test_an_overlong_frame_is_dropped(self):
+        body = bytes([sonyhp.HEADER]) + b"\x01" * (sonyhp.MAX_MESSAGE_SIZE + 10) + bytes([sonyhp.TRAILER])
+        good = sonyhp.encode_message(sonyhp.MSG_COMMAND_1, 0, b"\x05")
+        link = sonyhp.Link("AA:BB:CC:DD:EE:FF")
+        link.sock = FakeStream(b"")
+        link._buffer.extend(body + good)
+        self.assertEqual(link._read_frame(0.1)[2], b"\x05")
+
+
+class TestLocalSocketBounds(unittest.TestCase):
+    def test_a_trickling_client_is_cut_off_by_the_deadline(self):
+        daemon = sonyhp.Daemon()
+        daemon.REQUEST_TIMEOUT = 0.1
+        client = FakeStream(b"{", delay=0.02)
+        listener = mock.Mock()
+        listener.accept.return_value = (client, None)
+        started = time.monotonic()
+        daemon.accept(listener)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(client.closed)
+        self.assertLess(client.calls, 20)
+
+    def test_ask_daemon_gives_up_on_a_reply_that_never_ends(self):
+        endless = FakeStream(b"a" * 4096)
+        with mock.patch.object(sonyhp, "daemon_socket", return_value=endless):
+            self.assertIsNone(sonyhp.ask_daemon({"cmd": "status"}))
+        self.assertLessEqual(endless.calls, sonyhp.MAX_LINE_BYTES // 4096 + 2)
+        self.assertTrue(endless.closed)
+
+    def test_ask_daemon_still_reads_a_normal_reply(self):
+        reply = FakeStream(b'{"ok": true}\n')
+        with mock.patch.object(sonyhp, "daemon_socket", return_value=reply):
+            self.assertEqual(sonyhp.ask_daemon({"cmd": "status"}), {"ok": True})
 
 
 class TestBluetoothctlInvocation(unittest.TestCase):

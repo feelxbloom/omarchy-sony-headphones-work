@@ -156,6 +156,14 @@ channel starts refusing the right one too. The answer is cached under
 written without following symlinks; a cache that cannot be made private is
 declined and discovery simply runs again.
 
+Everything the headphones send is treated as untrusted input with fixed
+bounds. The SDP lookup is capped at 8 KiB of record data, 8 round trips and
+8 seconds overall, a continuation must make progress and never repeat, and
+the record parser limits nesting depth. The RFCOMM reader never holds more
+than one frame's worth of bytes that lack an end marker. Requests on the local
+control socket have a whole-request deadline and a line-size limit, so a slow
+or runaway peer on either side cannot keep the helper busy or growing.
+
 The headphones drop the control session on their own after a while and nothing
 announces it, so the daemon treats silence in answer to its periodic battery
 poll as a dead link, and a command that arrives on one reconnects and runs
@@ -183,7 +191,7 @@ be a socket you own.
 ## Development
 
 ```bash
-python3 tests/test_protocol.py     # 100 tests, no headphones required
+python3 tests/test_protocol.py     # 126 tests, no headphones required
 omarchy plugin validate .
 ```
 
