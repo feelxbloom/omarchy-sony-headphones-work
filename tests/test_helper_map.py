@@ -1,6 +1,6 @@
 """Helper map coverage: every top-level helper symbol is indexed.
 
-The map in docs/helper-map.md is the only index into the single-file
+The map in docs/agents.md is the only index into the single-file
 helper, so a helper change that adds a top-level def or class without
 indexing it leaves the map stale. This reads both files as plain text and
 fails on any top-level name the map never mentions.
@@ -15,7 +15,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(os.path.dirname(HERE), "bin", "sony-headphones")
-MAP = os.path.join(os.path.dirname(HERE), "docs", "helper-map.md")
+MAP = os.path.join(os.path.dirname(HERE), "docs", "agents.md")
 
 TOP_LEVEL = re.compile(r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 
