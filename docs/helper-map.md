@@ -51,6 +51,7 @@ editing. Full-line security rationale lives in `docs/adr/` and `docs/architectur
 | `AUTO_POWER_OFF` / `V2_AUTO_POWER_OFF` (+ `_FROM_CODE`) | Auto power off values per generation |
 | `STC_SENSITIVITY` / `STC_TIMEOUT` (+ `_FROM_CODE`) | Speak-to-chat options |
 | `V2_BGM_ROOM` / `V2_BGM_ROOM_FROM_CODE` | Background-music room sizes |
+| `BGM_WRITE_KEYS` / `BGM_RESET_REASON` | BGM keys whose lost link is explained as a digital assistant |
 | `V2_CONNECTION_QUALITY_*` | Connection-quality values |
 | `MAX_AMBIENT_LEVEL` | Ambient slider ceiling |
 | `V2_ASC_SUBTYPES` / `V2_ASC_PROBE_ORDER` | v2 ambient dialect probe order |
@@ -145,6 +146,7 @@ editing. Full-line security rationale lives in `docs/adr/` and `docs/architectur
 | --- | --- |
 | `NotConnected` | The peer is gone; the failure signal throughout |
 | `Link` | One lock-step conversation over a transport |
+| `Link.interrupted_key` | A BGM key whose write raised, for `Daemon.lose_link` to explain |
 | `Link.connect` | Open the transport, establish, keep the channel |
 | `Link._establish` | Handshake, features and dialect negotiation for one candidate |
 | `Link._handshake` | INIT exchange; length decides v1 (4) vs v2 (8) |
@@ -172,7 +174,7 @@ editing. Full-line security rationale lives in `docs/adr/` and `docs/architectur
 | `_setting_context` | Shared gate: exclusivity, features, ambient and v2 discovery fields |
 | `setting_requests` | v1: key + value to requests |
 | `setting_requests_v2` | v2: key + value to requests |
-| `apply_setting` | Mark the key pending (clearing a prior refusal), write then pump until the read-back moves or `SETTLE_TIMEOUT`, recording a refusal on a no-move settle |
+| `apply_setting` | Mark the key pending (clearing a prior refusal), write then pump until the read-back moves or `SETTLE_TIMEOUT`, recording a refusal on a no-move settle; a BGM key that raises is remembered in `Link.interrupted_key` |
 | `_mark_pending` / `_settle_pending` | Publish/clear the `pending` key and record a `refused` entry |
 
 ## Feature tables and ceilings
@@ -223,11 +225,11 @@ editing. Full-line security rationale lives in `docs/adr/` and `docs/architectur
 | `Daemon.POLL_INTERVAL` / `RETRY_MIN` / `RETRY_MAX` / `REQUEST_TIMEOUT` / `MAX_SUBSCRIBERS` / `SUBSCRIBER_TIMEOUT` | Timing and subscriber bounds |
 | `_env_session_policy` / `_env_session_idle` | Read the boot policy from the environment, with safe defaults |
 | `Daemon.state` | Link state, or a disconnected state, with the daemon fields stamped |
-| `Daemon._stamp` | Overlay logging + session policy onto a state dict |
+| `Daemon._stamp` | Overlay logging + session policy onto a state dict, plus any `reset_refusal` |
 | `Daemon.publish` | Fan one state line out to subscribers |
 | `Daemon.drop` | Remove and close one subscriber |
 | `Daemon.try_connect` | Find a device and open the link, with backoff |
-| `Daemon.lose_link` | Close, clear and publish a disconnected state |
+| `Daemon.lose_link` | Close, clear and publish a disconnected state; a link lost on a BGM write records `Daemon.reset_refusal` |
 | `Daemon.release` | Hand the control session back deliberately, keeping last values |
 | `Daemon.reclaim` | Take the control session back and refresh it |
 | `Daemon.release_if_idle` | Release an on-demand session after its quiet spell |
